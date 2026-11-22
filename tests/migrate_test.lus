@@ -1,6 +1,6 @@
 local ROOT = string.match(TEST_DIR, "^(.*)[/\\][^/\\]*$")
 pledge("load", "fs")
-package.path = ROOT .. "/?.lus;" .. package.path
+package.path = `$ROOT/?.lus;$(package.path)`
 
 local migrate = require("migrate")
 

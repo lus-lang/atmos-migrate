@@ -2,13 +2,13 @@
 ---
 --- A migration is a file such as `0001_create_users.sql` in a directory, or an
 --- entry `{ name, up, down }` of a table. `migrate.up` applies the pending
---- migrations in the order of their numbers, each one in a transaction, and
---- records its name, the SHA-256 checksum of its SQL, and the time in the
+--- migrations in the order of their numbers, each in its own transaction,
+--- recording its name, the SHA-256 checksum of its SQL, and the time in the
 --- table `schema_migrations`. `migrate.down` reverts applied migrations with
 --- the SQL of their `.down.sql` files. `migrate.status` lists every migration
 --- with its state.
 ---
---- The database is any value with the three methods of the adapter interface.
+--- The database is any value that implements the adapter interface.
 --- `db:exec(sql)` runs one or more statements. `db:query(sql)` returns the
 --- rows of one statement, as an iterator or as an array, each row a table
 --- keyed by column name. `db:transaction(fn)` calls `fn`, commits when it
@@ -17,7 +17,7 @@
 --- literal, so the adapter needs no parameter binding.
 ---
 --- @package migrate
---- @version 0.1.0
+--- @version 1.0.0
 --- @lus 2.0
 --- @license 0BSD
 --- @repository https://github.com/lus-lang/atmos-migrate
@@ -33,17 +33,19 @@ local function fail(code, name, message, cause)
     error(setmetatable({ code = code, name = name, message = message, cause = cause }, MigrateError), 0)
 end
 
---- Returns true if `value` is an error object that this package raised.
+--- Returns true if `value` is an error object that `migrate` raised.
 ---
 --- The error object has a `message`, the `name` of the migration concerned,
---- and a `code`. The codes are `"checksum"` for an applied migration whose SQL
---- changed, `"missing"` for an applied migration that the source lacks,
---- `"order"` for a pending migration numbered below an applied one,
---- `"irreversible"` for a migration without down SQL, `"failed"` for SQL that
---- raised an error, which the `cause` field holds, and `"source"` for a
---- problem in the directory or the table of migrations.
+--- and a `code`, which is one of the following:
+---
+--- - `"checksum"` for an applied migration whose SQL changed.
+--- - `"missing"` for an applied migration that the source lacks.
+--- - `"order"` for a pending migration numbered below an applied one.
+--- - `"irreversible"` for a migration without down SQL.
+--- - `"failed"` for SQL that raised an error. The `cause` field holds that error.
+--- - `"source"` for a problem in the directory or the table of migrations.
 --- @param value any The value to test.
---- @return boolean
+--- @return boolean True for an error object of `migrate`.
 function M.iserror(value)
     return getmetatable(value) == MigrateError
 end
@@ -97,11 +99,12 @@ end
 --- A migration is a file whose name starts with a number and ends in `.sql`,
 --- such as `0001_create_users.sql`. A file with the same stem and the ending
 --- `.down.sql` holds the SQL that reverts it. Other files are skipped. The
---- number orders the migrations. Its width is free. The call requires
+--- number orders the migrations and may have any width. The call requires
 --- `fs:read` for the directory.
 ---
---- The call raises an error object with the code `"source"` when a `.sql` file has no number or when two files share a number.
---- @param dir string The directory.
+--- The call raises an error object with the code `"source"` when a `.sql`
+--- file has no number or when two files share a number.
+--- @param dir string The directory of migration files.
 --- @return table An array of `{ name, version, up, down, checksum }`, where `down` is nil for a migration without a down file.
 function M.load(dir)
     local names = fs.list(dir, "*.sql")
@@ -156,7 +159,7 @@ local function table_name(options)
 end
 
 local function quote(text)
-    return "'" .. text:gsub("'", "''") .. "'"
+    return `'$(text:gsub("'", "''"))'`
 end
 
 local function rows(db, sql)
@@ -262,18 +265,21 @@ end
 --- applied migration with the source and stops at the first difference.
 ---
 --- Each migration runs in a transaction of its own together with its record,
---- so a migration that fails leaves no trace and the ones before it stay
+--- so a migration that fails leaves no trace while the ones before it stay
 --- applied. SQL whose first line is the comment `-- migrate: no-transaction`
---- runs outside a transaction, for statements that a database refuses inside
---- one.
+--- runs outside a transaction, for statements that a database cannot run
+--- inside one.
 ---
---- The options are `table`, the name of the record table, which defaults to
---- `"schema_migrations"`, `to`, the name or the number of the last migration
---- to apply, `out_of_order`, which permits a pending migration numbered below
---- an applied one, and `clock`, a function that returns the time in seconds,
---- which defaults to `os.time`.
+--- The options are:
 ---
---- The call raises an error object, which `migrate.iserror` recognizes, with one of the codes `"checksum"`, `"missing"`, `"order"`, `"failed"`, and `"source"`.
+--- - `table`, the name of the record table, which defaults to `"schema_migrations"`.
+--- - `to`, the name or the number of the last migration to apply.
+--- - `out_of_order`, which permits a pending migration numbered below an applied one.
+--- - `clock`, a function that returns the time in seconds, which defaults to `os.time`.
+---
+--- The call raises an error object, which `migrate.iserror` recognizes, with
+--- one of the codes `"checksum"`, `"missing"`, `"order"`, `"failed"`, and
+--- `"source"`.
 --- @param db table The database adapter.
 --- @param source string|table A directory or an array of migrations.
 --- @param options table? The options.
@@ -302,12 +308,15 @@ end
 ---
 --- Without options the call reverts the latest applied migration. With
 --- `steps` it reverts that many. With `to`, the name or the number of a
---- migration, it reverts every migration applied after that one, and
---- `to = 0` reverts them all. Each migration runs its down SQL and the removal
+--- migration, it reverts every migration applied after that one. `to = 0`
+--- reverts them all. Each migration runs its down SQL and the removal
 --- of its record in one transaction. The `table` option names the record
 --- table.
 ---
---- The call raises an error object with the code `"irreversible"` when a migration has no down SQL, `"missing"` when the source lacks an applied migration that the call must revert, or `"failed"` when the down SQL raises an error.
+--- The call raises an error object with the code `"irreversible"` when a
+--- migration has no down SQL, `"missing"` when the source lacks an applied
+--- migration that the call must revert, or `"failed"` when the down SQL
+--- raises an error.
 --- @param db table The database adapter.
 --- @param source string|table A directory or an array of migrations.
 --- @param options table? `steps`, `to`, and `table`.
@@ -347,7 +356,7 @@ end
 --- and for an applied migration the time `applied_at` as ISO 8601 text. The
 --- boolean `changed` is true when the SQL of an applied migration differs
 --- from its recorded checksum. The boolean `missing` is true for an applied
---- migration that the source lacks. The boolean `reversible` tells whether
+--- migration that the source lacks. The boolean `reversible` is true when
 --- the source has down SQL for the migration. The call creates the record
 --- table when the database lacks it and changes nothing else.
 --- @param db table The database adapter.
