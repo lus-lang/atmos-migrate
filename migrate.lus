@@ -56,8 +56,7 @@ end
 
 local function read_file(path)
     local f <close> = io.open(path, "r")
-    local text = f:read("a")
-    return text
+    return f:read("a")
 end
 
 local function by_version(a, b)
