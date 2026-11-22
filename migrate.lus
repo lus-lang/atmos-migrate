@@ -1,0 +1,395 @@
+--- Applies numbered SQL migrations to a database and records each one.
+---
+--- A migration is a file such as `0001_create_users.sql` in a directory, or an
+--- entry `{ name, up, down }` of a table. `migrate.up` applies the pending
+--- migrations in the order of their numbers, each one in a transaction, and
+--- records its name, the SHA-256 checksum of its SQL, and the time in the
+--- table `schema_migrations`. `migrate.down` reverts applied migrations with
+--- the SQL of their `.down.sql` files. `migrate.status` lists every migration
+--- with its state.
+---
+--- The database is any value with the three methods of the adapter interface.
+--- `db:exec(sql)` runs one or more statements. `db:query(sql)` returns the
+--- rows of one statement, as an iterator or as an array, each row a table
+--- keyed by column name. `db:transaction(fn)` calls `fn`, commits when it
+--- returns, and rolls back when it raises. A handle from `io.sqlite` has these
+--- methods already. `migrate` writes every value into its SQL as a quoted
+--- literal, so the adapter needs no parameter binding.
+---
+--- @package migrate
+--- @version 0.1.0
+--- @lus 2.0
+--- @license 0BSD
+--- @repository https://github.com/lus-lang/atmos-migrate
+--- @permission fs:read Reads the migration files of the directory that a call names.
+
+local M = {}
+
+local MigrateError = {}
+MigrateError.__index = MigrateError
+MigrateError.__tostring = function(e) return e.message end
+
+local function fail(code, name, message, cause)
+    error(setmetatable({ code = code, name = name, message = message, cause = cause }, MigrateError), 0)
+end
+
+--- Returns true if `value` is an error object that this package raised.
+---
+--- The error object has a `message`, the `name` of the migration concerned,
+--- and a `code`. The codes are `"checksum"` for an applied migration whose SQL
+--- changed, `"missing"` for an applied migration that the source lacks,
+--- `"order"` for a pending migration numbered below an applied one,
+--- `"irreversible"` for a migration without down SQL, `"failed"` for SQL that
+--- raised an error, which the `cause` field holds, and `"source"` for a
+--- problem in the directory or the table of migrations.
+--- @param value any The value to test.
+--- @return boolean
+function M.iserror(value)
+    return getmetatable(value) == MigrateError
+end
+
+local function checksum(text)
+    return string.transcode(crypto.hash("sha256", text), "binary", "hex")
+end
+
+local function read_file(path)
+    local f <close> = io.open(path, "r")
+    return f:read("a")
+end
+
+local function by_version(a, b)
+    if a.version ~= b.version then
+        return a.version < b.version
+    end
+    return a.name < b.name
+end
+
+local function finish(list)
+    table.sort(list, by_version)
+    for i = 2, #list do
+        if list[i].version == list[i - 1].version then
+            fail("source", list[i].name, `migrations $(list[i - 1].name) and $(list[i].name) share the number $(list[i].version)`)
+        end
+    end
+    return list
+end
+
+local function entry(name, up, down)
+    local digits = type(name) == "string" and name:match("^(%d+)") or nil
+    if digits == nil then
+        fail("source", tostring(name), `migration name '$(tostring(name))' does not start with a number`)
+    end
+    local kind = type(up)
+    if kind ~= "string" and kind ~= "function" then
+        fail("source", name, `migration $name has no up SQL`)
+    end
+    return {
+        name = name,
+        version = math.tointeger(tonumber(digits)),
+        up = up,
+        down = down,
+        checksum = checksum(kind == "string" and up or name),
+    }
+end
+
+--- Reads the migrations of a directory and returns them in order.
+---
+--- A migration is a file whose name starts with a number and ends in `.sql`,
+--- such as `0001_create_users.sql`. A file with the same stem and the ending
+--- `.down.sql` holds the SQL that reverts it. Other files are skipped. The
+--- number orders the migrations. Its width is free. The call requires
+--- `fs:read` for the directory.
+---
+--- The call raises an error object with the code `"source"` when a `.sql` file has no number or when two files share a number.
+--- @param dir string The directory.
+--- @return table An array of `{ name, version, up, down, checksum }`, where `down` is nil for a migration without a down file.
+function M.load(dir)
+    local names = fs.list(dir, "*.sql")
+    local downs = {}
+    local list = {}
+    for i = 1, #names do
+        local name = names[i]
+        if stem = name:match("^(.*)%.down%.sql$") then
+            downs[stem] = name
+        end
+    end
+    for i = 1, #names do
+        local name = names[i]
+        if not name:find("%.down%.sql$") then
+            local stem = name:sub(1, -5)
+            local down = downs[stem]
+            downs[stem] = nil
+            list[#list + 1] = entry(name, read_file(fs.path.join(dir, name)), down and read_file(fs.path.join(dir, down)) or nil)
+        end
+    end
+    if orphan = next(downs) then
+        fail("source", downs[orphan], `$(downs[orphan]) has no migration $orphan.sql`)
+    end
+    return finish(list)
+end
+
+local function resolve(source)
+    if type(source) == "string" then
+        return M.load(source)
+    end
+    if type(source) ~= "table" then
+        error("bad argument #2 (directory or table of migrations expected)", 3)
+    end
+    local list = {}
+    for i = 1, #source do
+        local m = source[i]
+        if getmetatable(m) == nil and m.checksum and m.version then
+            list[i] = m
+        else
+            list[i] = entry(m.name, m.up, m.down)
+        end
+    end
+    return finish(list)
+end
+
+local function table_name(options)
+    local name = options and options.table or "schema_migrations"
+    if type(name) ~= "string" or not name:find("^[%a_][%w_]*$") and not name:find("^[%a_][%w_]*%.[%a_][%w_]*$") then
+        error(`invalid migration table name '$(tostring(name))'`, 3)
+    end
+    return name
+end
+
+local function quote(text)
+    return "'" .. text:gsub("'", "''") .. "'"
+end
+
+local function rows(db, sql)
+    local result = db:query(sql)
+    if type(result) == "table" then
+        return result
+    end
+    local list = {}
+    for row in result do
+        list[#list + 1] = row
+    end
+    return list
+end
+
+local function applied(db, tname)
+    db:exec(`CREATE TABLE IF NOT EXISTS $tname (name TEXT PRIMARY KEY, checksum TEXT NOT NULL, applied_at TEXT NOT NULL)`)
+    local list = rows(db, `SELECT name, checksum, applied_at FROM $tname`)
+    local by_name = {}
+    for i = 1, #list do
+        local row = list[i]
+        row.version = math.tointeger(tonumber(row.name:match("^(%d+)") or "0"))
+        by_name[row.name] = row
+    end
+    table.sort(list, by_version)
+    return list, by_name
+end
+
+local function target_version(list, to)
+    if to == nil then
+        return nil
+    end
+    if math.type(to) == "integer" then
+        return to
+    end
+    for i = 1, #list do
+        if list[i].name == to then
+            return list[i].version
+        end
+    end
+    error(`unknown migration '$(tostring(to))'`, 3)
+end
+
+local function no_transaction(sql)
+    return type(sql) == "string" and sql:find("^%-%-%s*migrate:%s*no%-transaction") ~= nil
+end
+
+local function run(db, m, sql, record)
+    local function body()
+        if type(sql) == "function" then
+            sql(db)
+        else
+            db:exec(sql)
+        end
+        db:exec(record)
+    end
+    local ok, err
+    if no_transaction(sql) then
+        ok, err = catch body()
+    else
+        ok, err = catch db:transaction(body)
+    end
+    if not ok then
+        fail("failed", m.name, `migration $(m.name) failed: $(tostring(err))`, err)
+    end
+end
+
+-- Checks the applied rows against the source and returns the pending migrations.
+local function pending(list, done, done_by_name, options)
+    local known = {}
+    for i = 1, #list do
+        local m = list[i]
+        known[m.name] = true
+        local row = done_by_name[m.name]
+        if row and row.checksum ~= m.checksum then
+            fail("checksum", m.name, `migration $(m.name) changed after it was applied`)
+        end
+    end
+    for i = 1, #done do
+        if not known[done[i].name] then
+            fail("missing", done[i].name, `applied migration $(done[i].name) is absent from the source`)
+        end
+    end
+    local last = #done > 0 and done[#done].version or -1
+    local todo = {}
+    for i = 1, #list do
+        local m = list[i]
+        if not done_by_name[m.name] then
+            if m.version < last and not (options and options.out_of_order) then
+                fail("order", m.name, `migration $(m.name) is numbered below the applied migration $(done[#done].name)`)
+            end
+            todo[#todo + 1] = m
+        end
+    end
+    return todo
+end
+
+--- Applies the pending migrations of a source in order.
+---
+--- `source` is a directory, read as `migrate.load` reads it, or an array of
+--- `{ name, up, down }` tables. In a table, `up` and `down` are SQL strings, or
+--- functions that receive `db`. The checksum of a function is that of its
+--- name. Before it applies anything, the call compares the checksum of every
+--- applied migration with the source and stops at the first difference.
+---
+--- Each migration runs in a transaction of its own together with its record,
+--- so a migration that fails leaves no trace and the ones before it stay
+--- applied. SQL whose first line is the comment `-- migrate: no-transaction`
+--- runs outside a transaction, for statements that a database refuses inside
+--- one.
+---
+--- The options are `table`, the name of the record table, which defaults to
+--- `"schema_migrations"`, `to`, the name or the number of the last migration
+--- to apply, `out_of_order`, which permits a pending migration numbered below
+--- an applied one, and `clock`, a function that returns the time in seconds,
+--- which defaults to `os.time`.
+---
+--- The call raises an error object, which `migrate.iserror` recognizes, with one of the codes `"checksum"`, `"missing"`, `"order"`, `"failed"`, and `"source"`.
+--- @param db table The database adapter.
+--- @param source string|table A directory or an array of migrations.
+--- @param options table? The options.
+--- @return table The names of the migrations that the call applied, in order.
+function M.up(db, source, options)
+    local tname = table_name(options)
+    local list = resolve(source)
+    local limit = target_version(list, options and options.to)
+    local clock = options and options.clock or os.time
+    local done, done_by_name = applied(db, tname)
+    local todo = pending(list, done, done_by_name, options)
+    local names = {}
+    for i = 1, #todo do
+        local m = todo[i]
+        if limit and m.version > limit then
+            break
+        end
+        local at = time.instant(math.floor(clock())):iso()
+        run(db, m, m.up, `INSERT INTO $tname (name, checksum, applied_at) VALUES ($(quote(m.name)), '$(m.checksum)', '$at')`)
+        names[#names + 1] = m.name
+    end
+    return names
+end
+
+--- Reverts applied migrations, the latest first.
+---
+--- Without options the call reverts the latest applied migration. With
+--- `steps` it reverts that many. With `to`, the name or the number of a
+--- migration, it reverts every migration applied after that one, and
+--- `to = 0` reverts them all. Each migration runs its down SQL and the removal
+--- of its record in one transaction. The `table` option names the record
+--- table.
+---
+--- The call raises an error object with the code `"irreversible"` when a migration has no down SQL, `"missing"` when the source lacks an applied migration that the call must revert, or `"failed"` when the down SQL raises an error.
+--- @param db table The database adapter.
+--- @param source string|table A directory or an array of migrations.
+--- @param options table? `steps`, `to`, and `table`.
+--- @return table The names of the migrations that the call reverted, in order.
+function M.down(db, source, options)
+    local tname = table_name(options)
+    local list = resolve(source)
+    local limit = target_version(list, options and options.to)
+    local steps = options and options.steps or (limit and math.maxinteger or 1)
+    local by_name = {}
+    for i = 1, #list do
+        by_name[list[i].name] = list[i]
+    end
+    local done = applied(db, tname)
+    local names = {}
+    for i = #done, 1, -1 do
+        local row = done[i]
+        if #names >= steps or (limit and row.version <= limit) then
+            break
+        end
+        local m = by_name[row.name]
+        if m == nil then
+            fail("missing", row.name, `applied migration $(row.name) is absent from the source`)
+        end
+        if m.down == nil then
+            fail("irreversible", m.name, `migration $(m.name) has no down SQL`)
+        end
+        run(db, m, m.down, `DELETE FROM $tname WHERE name = $(quote(m.name))`)
+        names[#names + 1] = m.name
+    end
+    return names
+end
+
+--- Lists every migration of the source and of the record table with its state.
+---
+--- Each entry has the `name`, the `version` number, the boolean `applied`,
+--- and for an applied migration the time `applied_at` as ISO 8601 text. The
+--- boolean `changed` is true when the SQL of an applied migration differs
+--- from its recorded checksum. The boolean `missing` is true for an applied
+--- migration that the source lacks. The boolean `reversible` tells whether
+--- the source has down SQL for the migration. The call creates the record
+--- table when the database lacks it and changes nothing else.
+--- @param db table The database adapter.
+--- @param source string|table A directory or an array of migrations.
+--- @param options table? `table`, the name of the record table.
+--- @return table An array of entries ordered by number.
+function M.status(db, source, options)
+    local tname = table_name(options)
+    local list = resolve(source)
+    local done, done_by_name = applied(db, tname)
+    local out = {}
+    local known = {}
+    for i = 1, #list do
+        local m = list[i]
+        local row = done_by_name[m.name]
+        known[m.name] = true
+        out[#out + 1] = {
+            name = m.name,
+            version = m.version,
+            applied = row ~= nil,
+            applied_at = row and row.applied_at or nil,
+            changed = row ~= nil and row.checksum ~= m.checksum,
+            missing = false,
+            reversible = m.down ~= nil,
+        }
+    end
+    for i = 1, #done do
+        local row = done[i]
+        if not known[row.name] then
+            out[#out + 1] = {
+                name = row.name,
+                version = row.version,
+                applied = true,
+                applied_at = row.applied_at,
+                changed = false,
+                missing = true,
+                reversible = false,
+            }
+        end
+    end
+    table.sort(out, by_version)
+    return out
+end
+
+return M
