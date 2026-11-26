@@ -13,8 +13,26 @@
 --- rows of one statement, as an iterator or as an array, each row a table
 --- keyed by column name. `db:transaction(fn)` calls `fn`, commits when it
 --- returns, and rolls back when it raises. A handle from `io.sqlite` has these
---- methods already. `migrate` writes every value into its SQL as a quoted
---- literal, so the adapter needs no parameter binding.
+--- methods already. Opening a database file with `io.sqlite` requires
+--- `fs:read` and `fs:write` for that file. `migrate` writes every value into
+--- its SQL as a quoted literal, so the adapter needs no parameter binding.
+---
+--- The following example applies the migrations of an application database,
+--- then reverts the latest.
+---
+--- ```lus nocheck
+--- local migrate = require("https://atmosp.here/2.0/migrate.lus")
+---
+--- local db = io.sqlite("app.db")
+---
+--- -- Applies migrations/0001_create_users.sql, migrations/0002_add_email.sql, ...
+--- for _, name in ipairs(migrate.up(db, "migrations")) do
+---     print("applied", name)
+--- end
+---
+--- print(migrate.status(db, "migrations")[1].name)  --> 0001_create_users.sql
+--- migrate.down(db, "migrations")  -- runs 0002_add_email.down.sql
+--- ```
 ---
 --- @package migrate
 --- @version 1.0.0
@@ -27,10 +45,16 @@ local M = {}
 
 local MigrateError = {}
 MigrateError.__index = MigrateError
-MigrateError.__tostring = function(e) return e.message end
+
+MigrateError.__tostring = function(e)
+    return e.message
+end
 
 local function fail(code, name, message, cause)
-    error(setmetatable({ code = code, name = name, message = message, cause = cause }, MigrateError), 0)
+    error(
+        setmetatable({ code = code, name = name, message = message, cause = cause }, MigrateError),
+        0
+    )
 end
 
 --- Returns true if `value` is an error object that `migrate` raised.
@@ -63,28 +87,39 @@ local function by_version(a, b)
     if a.version ~= b.version then
         return a.version < b.version
     end
+
     return a.name < b.name
 end
 
 local function finish(list)
     table.sort(list, by_version)
+
     for i = 2, #list do
         if list[i].version == list[i - 1].version then
-            fail("source", list[i].name, `migrations $(list[i - 1].name) and $(list[i].name) share the number $(list[i].version)`)
+            fail(
+                "source",
+                list[i].name,
+                `migrations $(list[i - 1].name) and $(list[i].name) share the number $(list[i].version)`
+            )
         end
     end
+
     return list
 end
 
 local function entry(name, up, down)
     local digits = type(name) == "string" and name:match("^(%d+)") or nil
+
     if digits == nil then
-        fail("source", tostring(name), `migration name '$(tostring(name))' does not start with a number`)
+        fail("source", tostring(name), `migration name '$name' does not start with a number`)
     end
+
     local kind = type(up)
+
     if kind ~= "string" and kind ~= "function" then
         fail("source", name, `migration $name has no up SQL`)
     end
+
     return {
         name = name,
         version = math.tointeger(tonumber(digits)),
@@ -110,24 +145,34 @@ function M.load(dir)
     local names = fs.list(dir, "*.sql")
     local downs = {}
     local list = {}
+
     for i = 1, #names do
         local name = names[i]
+
         if stem = name:match("^(.*)%.down%.sql$") then
             downs[stem] = name
         end
     end
+
     for i = 1, #names do
         local name = names[i]
+
         if not name:find("%.down%.sql$") then
             local stem = name:sub(1, -5)
             local down = downs[stem]
             downs[stem] = nil
-            list[#list + 1] = entry(name, read_file(fs.path.join(dir, name)), down and read_file(fs.path.join(dir, down)) or nil)
+            list[#list + 1] = entry(
+                name,
+                read_file(fs.path.join(dir, name)),
+                down and read_file(fs.path.join(dir, down)) or nil
+            )
         end
     end
+
     if orphan = next(downs) then
         fail("source", downs[orphan], `$(downs[orphan]) has no migration $orphan.sql`)
     end
+
     return finish(list)
 end
 
@@ -135,26 +180,34 @@ local function resolve(source)
     if type(source) == "string" then
         return M.load(source)
     end
+
     if type(source) ~= "table" then
         error("bad argument #2 (directory or table of migrations expected)", 3)
     end
+
     local list = {}
+
     for i = 1, #source do
         local m = source[i]
+
         if getmetatable(m) == nil and m.checksum and m.version then
             list[i] = m
         else
             list[i] = entry(m.name, m.up, m.down)
         end
     end
+
     return finish(list)
 end
 
 local function table_name(options)
-    local name = options and options.table or "schema_migrations"
-    if type(name) ~= "string" or not name:find("^[%a_][%w_]*$") and not name:find("^[%a_][%w_]*%.[%a_][%w_]*$") then
-        error(`invalid migration table name '$(tostring(name))'`, 3)
+    local name = options?.table or "schema_migrations"
+
+    if type(name) ~= "string"
+        or not name:find("^[%a_][%w_]*$") and not name:find("^[%a_][%w_]*%.[%a_][%w_]*$") then
+        error(`invalid migration table name '$name'`, 3)
     end
+
     return name
 end
 
@@ -164,25 +217,33 @@ end
 
 local function rows(db, sql)
     local result = db:query(sql)
+
     if type(result) == "table" then
         return result
     end
+
     local list = {}
+
     for row in result do
         list[#list + 1] = row
     end
+
     return list
 end
 
 local function applied(db, tname)
-    db:exec(`CREATE TABLE IF NOT EXISTS $tname (name TEXT PRIMARY KEY, checksum TEXT NOT NULL, applied_at TEXT NOT NULL)`)
+    db:exec(
+        `CREATE TABLE IF NOT EXISTS $tname (name TEXT PRIMARY KEY, checksum TEXT NOT NULL, applied_at TEXT NOT NULL)`
+    )
     local list = rows(db, `SELECT name, checksum, applied_at FROM $tname`)
     local by_name = {}
+
     for i = 1, #list do
         local row = list[i]
         row.version = math.tointeger(tonumber(row.name:match("^(%d+)") or "0"))
         by_name[row.name] = row
     end
+
     table.sort(list, by_version)
     return list, by_name
 end
@@ -191,15 +252,22 @@ local function target_version(list, to)
     if to == nil then
         return nil
     end
+
     if math.type(to) == "integer" then
         return to
     end
+
     for i = 1, #list do
         if list[i].name == to then
             return list[i].version
         end
     end
-    error(`unknown migration '$(tostring(to))'`, 3)
+
+    error(`unknown migration '$to'`, 3)
+end
+
+local function now()
+    return time.now():epoch()
 end
 
 local function no_transaction(sql)
@@ -213,46 +281,66 @@ local function run(db, m, sql, record)
         else
             db:exec(sql)
         end
+
         db:exec(record)
     end
-    local ok, err
-    if no_transaction(sql) then
-        ok, err = catch body()
-    else
-        ok, err = catch db:transaction(body)
+
+    local ok, err = catch do
+        if no_transaction(sql) then
+            body()
+        else
+            db:transaction(body)
+        end
     end
+
     if not ok then
-        fail("failed", m.name, `migration $(m.name) failed: $(tostring(err))`, err)
+        fail("failed", m.name, `migration $(m.name) failed: $err`, err)
     end
 end
 
 -- Checks the applied rows against the source and returns the pending migrations.
 local function pending(list, done, done_by_name, options)
     local known = {}
+
     for i = 1, #list do
         local m = list[i]
         known[m.name] = true
         local row = done_by_name[m.name]
+
         if row and row.checksum ~= m.checksum then
             fail("checksum", m.name, `migration $(m.name) changed after it was applied`)
         end
     end
+
     for i = 1, #done do
         if not known[done[i].name] then
-            fail("missing", done[i].name, `applied migration $(done[i].name) is absent from the source`)
+            fail(
+                "missing",
+                done[i].name,
+                `applied migration $(done[i].name) is absent from the source`
+            )
         end
     end
-    local last = #done > 0 and done[#done].version or -1
+
+    local last = done[#done]?.version or -1
     local todo = {}
+
     for i = 1, #list do
         local m = list[i]
+
         if not done_by_name[m.name] then
-            if m.version < last and not (options and options.out_of_order) then
-                fail("order", m.name, `migration $(m.name) is numbered below the applied migration $(done[#done].name)`)
+            if m.version < last and not options?.out_of_order then
+                fail(
+                    "order",
+                    m.name,
+                    `migration $(m.name) is numbered below the applied migration $(done[#done].name)`
+                )
             end
+
             todo[#todo + 1] = m
         end
     end
+
     return todo
 end
 
@@ -275,7 +363,7 @@ end
 --- - `table`, the name of the record table, which defaults to `"schema_migrations"`.
 --- - `to`, the name or the number of the last migration to apply.
 --- - `out_of_order`, which permits a pending migration numbered below an applied one.
---- - `clock`, a function that returns the time in seconds, which defaults to `os.time`.
+--- - `clock`, a function that returns the time in seconds, which defaults to the current time.
 ---
 --- The call raises an error object, which `migrate.iserror` recognizes, with
 --- one of the codes `"checksum"`, `"missing"`, `"order"`, `"failed"`, and
@@ -287,20 +375,29 @@ end
 function M.up(db, source, options)
     local tname = table_name(options)
     local list = resolve(source)
-    local limit = target_version(list, options and options.to)
-    local clock = options and options.clock or os.time
+    local limit = target_version(list, options?.to)
+    local clock = options?.clock or now
     local done, done_by_name = applied(db, tname)
     local todo = pending(list, done, done_by_name, options)
     local names = {}
+
     for i = 1, #todo do
         local m = todo[i]
+
         if limit and m.version > limit then
             break
         end
+
         local at = time.instant(math.floor(clock())):iso()
-        run(db, m, m.up, `INSERT INTO $tname (name, checksum, applied_at) VALUES ($(quote(m.name)), '$(m.checksum)', '$at')`)
+        run(
+            db,
+            m,
+            m.up,
+            `INSERT INTO $tname (name, checksum, applied_at) VALUES ($(quote(m.name)), '$(m.checksum)', '$at')`
+        )
         names[#names + 1] = m.name
     end
+
     return names
 end
 
@@ -324,29 +421,38 @@ end
 function M.down(db, source, options)
     local tname = table_name(options)
     local list = resolve(source)
-    local limit = target_version(list, options and options.to)
-    local steps = options and options.steps or (limit and math.maxinteger or 1)
+    local limit = target_version(list, options?.to)
+    local steps = options?.steps or (limit and math.maxinteger or 1)
     local by_name = {}
+
     for i = 1, #list do
         by_name[list[i].name] = list[i]
     end
+
     local done = applied(db, tname)
     local names = {}
+
     for i = #done, 1, -1 do
         local row = done[i]
+
         if #names >= steps or (limit and row.version <= limit) then
             break
         end
+
         local m = by_name[row.name]
+
         if m == nil then
             fail("missing", row.name, `applied migration $(row.name) is absent from the source`)
         end
+
         if m.down == nil then
             fail("irreversible", m.name, `migration $(m.name) has no down SQL`)
         end
+
         run(db, m, m.down, `DELETE FROM $tname WHERE name = $(quote(m.name))`)
         names[#names + 1] = m.name
     end
+
     return names
 end
 
@@ -369,6 +475,7 @@ function M.status(db, source, options)
     local done, done_by_name = applied(db, tname)
     local out = {}
     local known = {}
+
     for i = 1, #list do
         local m = list[i]
         local row = done_by_name[m.name]
@@ -377,14 +484,16 @@ function M.status(db, source, options)
             name = m.name,
             version = m.version,
             applied = row ~= nil,
-            applied_at = row and row.applied_at or nil,
+            applied_at = row?.applied_at,
             changed = row ~= nil and row.checksum ~= m.checksum,
             missing = false,
             reversible = m.down ~= nil,
         }
     end
+
     for i = 1, #done do
         local row = done[i]
+
         if not known[row.name] then
             out[#out + 1] = {
                 name = row.name,
@@ -397,6 +506,7 @@ function M.status(db, source, options)
             }
         end
     end
+
     table.sort(out, by_version)
     return out
 end

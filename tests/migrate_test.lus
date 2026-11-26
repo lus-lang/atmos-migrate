@@ -9,12 +9,14 @@ local counter = 0
 -- Writes a directory of migration files and returns its path.
 local function dir_with(files)
     counter = counter + 1
-    local dir = "migrations_" .. counter
+    local dir = `migrations_$counter`
     fs.createdirectory(dir, true)
+
     for name, text in pairs(files) do
         local f <close> = io.open(fs.path.join(dir, name), "w")
         f:write(text)
     end
+
     return dir
 end
 
@@ -24,14 +26,19 @@ end
 
 local function names(db, sql)
     local out = {}
+
     for row in db:query(sql) do
         out[#out + 1] = row.name
     end
+
     return table.concat(out, ",")
 end
 
 local function tables(db)
-    return names(db, "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+    return names(
+        db,
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+    )
 end
 
 local BASIC = {
@@ -62,7 +69,9 @@ end
 local function load_rejects_bad_sources_test()
     local ok, err = catch migrate.load(dir_with({ ["create.sql"] = "SELECT 1;" }))
     assert(not ok and migrate.iserror(err) and err.code == "source")
-    ok, err = catch migrate.load(dir_with({ ["1_a.sql"] = "SELECT 1;", ["01_b.sql"] = "SELECT 1;" }))
+    ok, err = catch migrate.load(
+        dir_with({ ["1_a.sql"] = "SELECT 1;", ["01_b.sql"] = "SELECT 1;" })
+    )
     assert(not ok and err.code == "source" and tostring(err):find("share the number 1", 1, true))
     ok, err = catch migrate.load(dir_with({ ["1_a.down.sql"] = "SELECT 1;" }))
     assert(not ok and err.code == "source" and err.name == "1_a.down.sql")
@@ -73,7 +82,10 @@ local function up_applies_in_order_test()
     local db <close> = memory()
     local dir = dir_with(BASIC)
     local applied = migrate.up(db, dir)
-    assert(table.concat(applied, ",") == "0001_create_users.sql,0002_create_posts.sql,0010_add_email.sql")
+    assert(
+        table.concat(applied, ",")
+            == "0001_create_users.sql,0002_create_posts.sql,0010_add_email.sql"
+    )
     assert(tables(db) == "posts,schema_migrations,users")
     db:run("INSERT INTO users (name, email) VALUES (?, ?)", "ada", "ada@example.com")
     assert(#migrate.up(db, dir) == 0)
@@ -81,9 +93,19 @@ end
 
 local function up_records_checksum_and_time_test()
     local db <close> = memory()
-    migrate.up(db, dir_with(BASIC), { clock = function() return 1782998100 end })
+
+    migrate.up(db, dir_with(BASIC), {
+        clock = function()
+            return 1782998100
+        end,
+    })
+
     local row = db:query("SELECT * FROM schema_migrations WHERE name = '0001_create_users.sql'")()
-    local expected = string.transcode(crypto.hash("sha256", BASIC["0001_create_users.sql"]), "binary", "hex")
+    local expected = string.transcode(
+        crypto.hash("sha256", BASIC["0001_create_users.sql"]),
+        "binary",
+        "hex"
+    )
     assert(row.checksum == expected)
     assert(row.applied_at == "2026-07-02T13:15:00Z")
 end
@@ -96,7 +118,10 @@ local function up_to_target_test()
     assert(#migrate.up(db, dir, { to = "0002_create_posts.sql" }) == 1)
     assert(#migrate.up(db, dir, { to = 2 }) == 0)
     assert(table.concat(migrate.up(db, dir), ",") == "0010_add_email.sql")
-    assert(raises(function() migrate.up(db, dir, { to = "nope.sql" }) end, "unknown migration 'nope.sql'"))
+
+    assert(raises(function()
+        migrate.up(db, dir, { to = "nope.sql" })
+    end, "unknown migration 'nope.sql'"))
 end
 
 local function checksum_change_stops_test()
@@ -109,7 +134,10 @@ local function checksum_change_stops_test()
     assert(err.code == "checksum" and err.name == "0001_create_users.sql")
     assert(tostring(err) == "migration 0001_create_users.sql changed after it was applied")
     -- The pending migration did not run.
-    assert(names(db, "SELECT name FROM schema_migrations ORDER BY name") == "0001_create_users.sql,0002_create_posts.sql")
+    assert(
+        names(db, "SELECT name FROM schema_migrations ORDER BY name")
+            == "0001_create_users.sql,0002_create_posts.sql"
+    )
 end
 
 local function failed_migration_rolls_back_test()
@@ -132,18 +160,38 @@ end
 local function table_source_test()
     local db <close> = memory()
     local seen
+
     local source = {
-        { name = "0002_seed", up = function(d) d:exec("INSERT INTO t VALUES (7)") seen = d end, down = function(d) d:exec("DELETE FROM t") end },
+        {
+            name = "0002_seed",
+            up = function(d)
+                d:exec("INSERT INTO t VALUES (7)")
+                seen = d
+            end,
+            down = function(d)
+                d:exec("DELETE FROM t")
+            end,
+        },
         { name = "0001_create", up = "CREATE TABLE t (x);", down = "DROP TABLE t;" },
     }
+
     assert(table.concat(migrate.up(db, source), ",") == "0001_create,0002_seed")
     assert(seen == db)
     assert(db:query("SELECT x FROM t")().x == 7)
     assert(table.concat(migrate.down(db, source), ",") == "0002_seed")
     assert(db:query("SELECT count(*) AS n FROM t")().n == 0)
-    assert(raises(function() migrate.up(db, { { name = "create", up = "SELECT 1" } }) end, "does not start with a number"))
-    assert(raises(function() migrate.up(db, { { name = "1_x" } }) end, "has no up SQL"))
-    assert(raises(function() migrate.up(db, 42) end, "directory or table of migrations expected"))
+
+    assert(raises(function()
+        migrate.up(db, { { name = "create", up = "SELECT 1" } })
+    end, "does not start with a number"))
+
+    assert(raises(function()
+        migrate.up(db, { { name = "1_x" } })
+    end, "has no up SQL"))
+
+    assert(raises(function()
+        migrate.up(db, 42)
+    end, "directory or table of migrations expected"))
 end
 
 local function loaded_list_is_a_source_test()
@@ -160,7 +208,10 @@ local function down_default_and_steps_test()
     local dir = dir_with(files)
     migrate.up(db, dir)
     assert(table.concat(migrate.down(db, dir), ",") == "0010_add_email.sql")
-    assert(table.concat(migrate.down(db, dir, { steps = 2 }), ",") == "0002_create_posts.sql,0001_create_users.sql")
+    assert(
+        table.concat(migrate.down(db, dir, { steps = 2 }), ",")
+            == "0002_create_posts.sql,0001_create_users.sql"
+    )
     assert(tables(db) == "schema_migrations")
     assert(#migrate.down(db, dir) == 0)
     assert(#migrate.up(db, dir) == 3)
@@ -172,7 +223,10 @@ local function down_to_target_test()
     files["0010_add_email.down.sql"] = "ALTER TABLE users DROP COLUMN email;"
     local dir = dir_with(files)
     migrate.up(db, dir)
-    assert(table.concat(migrate.down(db, dir, { to = "0001_create_users.sql" }), ",") == "0010_add_email.sql,0002_create_posts.sql")
+    assert(
+        table.concat(migrate.down(db, dir, { to = "0001_create_users.sql" }), ",")
+            == "0010_add_email.sql,0002_create_posts.sql"
+    )
     assert(tables(db) == "schema_migrations,users")
     migrate.up(db, dir)
     assert(#migrate.down(db, dir, { to = 0 }) == 3)
@@ -185,12 +239,17 @@ local function down_without_file_test()
     migrate.up(db, dir)
     local ok, err = catch migrate.down(db, dir)
     assert(not ok and err.code == "irreversible" and err.name == "0010_add_email.sql")
-    assert(names(db, "SELECT name FROM schema_migrations WHERE name LIKE '0010%'") == "0010_add_email.sql")
+    assert(
+        names(db, "SELECT name FROM schema_migrations WHERE name LIKE '0010%'")
+            == "0010_add_email.sql"
+    )
 end
 
 local function failed_down_keeps_record_test()
     local db <close> = memory()
-    local source = { { name = "1_a", up = "CREATE TABLE a (x);", down = "DROP TABLE a; DROP TABLE nope;" } }
+    local source = {
+        { name = "1_a", up = "CREATE TABLE a (x);", down = "DROP TABLE a; DROP TABLE nope;" },
+    }
     migrate.up(db, source)
     local ok, err = catch migrate.down(db, source)
     assert(not ok and err.code == "failed")
@@ -205,10 +264,21 @@ local function status_test()
     local before = migrate.status(db, dir)
     assert(#before == 3 and not before[1].applied and before[1].applied_at == nil)
     assert(before[1].reversible and not before[3].reversible)
-    migrate.up(db, dir, { to = 2, clock = function() return 0 end })
+
+    migrate.up(db, dir, {
+        to = 2,
+        clock = function()
+            return 0
+        end,
+    })
+
     files["0002_create_posts.sql"] = "CREATE TABLE posts (id);"
     local st = migrate.status(db, dir_with(files))
-    assert(st[1].name == "0001_create_users.sql" and st[1].applied and st[1].applied_at == "1970-01-01T00:00:00Z")
+    assert(
+        st[1].name == "0001_create_users.sql"
+            and st[1].applied
+            and st[1].applied_at == "1970-01-01T00:00:00Z"
+    )
     assert(not st[1].changed and st[2].changed and st[2].applied)
     assert(not st[3].applied and st[3].version == 10)
 end
@@ -228,7 +298,10 @@ end
 
 local function out_of_order_test()
     local db <close> = memory()
-    local source = { { name = "1_a", up = "CREATE TABLE a (x);" }, { name = "3_c", up = "CREATE TABLE c (x);" } }
+    local source = {
+        { name = "1_a", up = "CREATE TABLE a (x);" },
+        { name = "3_c", up = "CREATE TABLE c (x);" },
+    }
     migrate.up(db, source)
     source[#source + 1] = { name = "2_b", up = "CREATE TABLE b (x);" }
     local ok, err = catch migrate.up(db, source)
@@ -245,7 +318,10 @@ local function custom_table_test()
     assert(migrate.status(db, source, { table = "app_migrations" })[1].applied)
     migrate.down(db, source, { table = "app_migrations" })
     assert(tables(db) == "app_migrations")
-    assert(raises(function() migrate.up(db, source, { table = "x; DROP TABLE a" }) end, "invalid migration table name"))
+
+    assert(raises(function()
+        migrate.up(db, source, { table = "x; DROP TABLE a" })
+    end, "invalid migration table name"))
 end
 
 local function quoted_name_test()
@@ -260,14 +336,20 @@ end
 local function no_transaction_test()
     local in_transaction = 0
     local db <close> = memory()
+
     local adapter = {
-        exec = function(_, sql) return db:exec(sql) end,
-        query = function(_, sql) return db:query(sql) end,
+        exec = function(_, sql)
+            return db:exec(sql)
+        end,
+        query = function(_, sql)
+            return db:query(sql)
+        end,
         transaction = function(_, fn)
             in_transaction = in_transaction + 1
             return db:transaction(fn)
         end,
     }
+
     migrate.up(adapter, {
         { name = "1_a", up = "CREATE TABLE a (x);" },
         { name = "2_b", up = "-- migrate: no-transaction\nCREATE TABLE b (x);" },
@@ -280,25 +362,36 @@ end
 local function array_adapter_test()
     local db <close> = memory()
     local log = {}
+
     local adapter = {
-        exec = function(_, sql) log[#log + 1] = sql return db:exec(sql) end,
+        exec = function(_, sql)
+            log[#log + 1] = sql
+            return db:exec(sql)
+        end,
         query = function(_, sql)
             local out = {}
+
             for row in db:query(sql) do
                 out[#out + 1] = row
             end
+
             return out
         end,
         transaction = function(_, fn)
             db:exec("BEGIN")
             local ok, err = catch fn()
             db:exec(ok and "COMMIT" or "ROLLBACK")
+
             if not ok then
                 error(err, 0)
             end
         end,
     }
-    local source = { { name = "1_a", up = "CREATE TABLE a (x);", down = "DROP TABLE a;" }, { name = "2_b", up = "INSERT INTO nope VALUES (1);" } }
+
+    local source = {
+        { name = "1_a", up = "CREATE TABLE a (x);", down = "DROP TABLE a;" },
+        { name = "2_b", up = "INSERT INTO nope VALUES (1);" },
+    }
     local ok, err = catch migrate.up(adapter, source)
     assert(not ok and err.code == "failed")
     assert(migrate.status(adapter, source)[1].applied)
@@ -308,10 +401,12 @@ end
 
 local function file_database_test()
     local dir = dir_with(BASIC)
+
     do
         local db <close> = io.sqlite("app.db")
         assert(#migrate.up(db, dir) == 3)
     end
+
     local db <close> = io.sqlite("app.db")
     assert(#migrate.up(db, dir) == 0)
     assert(migrate.status(db, dir)[3].applied)
